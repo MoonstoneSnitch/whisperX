@@ -76,7 +76,8 @@ def cli():
 
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face Access Token to access PyAnnote gated models")
 
-    parser.add_argument("--print_progress", type=str2bool, default = False, help = "if True, progress will be printed in transcribe() and align() methods.")
+    parser.add_argument("--print_progress", type=str2bool, default = False, help = "if True, progress will be printed for each processing stage (transcription, alignment, diarization).")
+    parser.add_argument("--structured_output", type=str2bool, default = False, help = "if True, emit machine-readable JSON status events (one per line) on stdout instead of human-readable logs; implies --print_progress.")
     parser.add_argument("--version", "-V", action="version", version=f"%(prog)s {importlib.metadata.version('whisperx')}",help="Show whisperx version information and exit")
     parser.add_argument("--python-version", "-P", action="version", version=f"Python {platform.python_version()} ({platform.python_implementation()})",help="Show python version information and exit")
     # fmt: on
@@ -85,13 +86,18 @@ def cli():
 
     log_level = args.get("log_level")
     verbose = args.get("verbose")
+    structured_output = args.pop("structured_output")
+
+    # Structured output requires progress events to be emitted.
+    if structured_output:
+        args["print_progress"] = True
 
     if log_level is not None:
-        setup_logging(level=log_level)
+        setup_logging(level=log_level, structured_output=structured_output)
     elif verbose:
-        setup_logging(level="info")
+        setup_logging(level="info", structured_output=structured_output)
     else:
-        setup_logging(level="warning")
+        setup_logging(level="warning", structured_output=structured_output)
 
     from whisperx.transcribe import transcribe_task
 

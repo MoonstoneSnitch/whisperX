@@ -23,7 +23,7 @@ from whisperx.schema import (
 )
 import nltk
 from nltk.data import load as nltk_load
-from whisperx.log_utils import get_logger
+from whisperx.log_utils import get_logger, log_progress, STAGE_ALIGNMENT
 
 logger = get_logger(__name__)
 
@@ -149,11 +149,6 @@ def align(
     segment_data: dict[int, SegmentData] = {}
     for sdx, segment in enumerate(transcript):
         # strip spaces at beginning / end, but keep track of the amount.
-        if print_progress:
-            base_progress = ((sdx + 1) / total_segments) * 100
-            percent_complete = (50 + base_progress / 2) if combined_progress else base_progress
-            print(f"Progress: {percent_complete:.2f}%...")
-
         num_leading = len(segment["text"]) - len(segment["text"].lstrip())
         num_trailing = len(segment["text"]) - len(segment["text"].rstrip())
         text = segment["text"]
@@ -405,6 +400,10 @@ def align(
             agg_dict["avg_logprob"] = "first"
         aligned_subsegments= aligned_subsegments.groupby(["start", "end"], as_index=False).agg(agg_dict)
         aligned_subsegments = aligned_subsegments.to_dict('records')
+        if print_progress:
+            base_progress = ((sdx + 1) / total_segments) * 100
+            percent_complete = (50 + base_progress / 2) if combined_progress else base_progress
+            log_progress(STAGE_ALIGNMENT, percent_complete, logger=logger)
         if progress_callback is not None:
             progress_callback(((sdx + 1) / total_segments) * 100)
 
