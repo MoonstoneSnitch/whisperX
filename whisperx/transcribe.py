@@ -12,7 +12,17 @@ from whisperx.audio import load_audio
 from whisperx.diarize import DiarizationPipeline, assign_word_speakers
 from whisperx.schema import AlignedTranscriptionResult, TranscriptionResult
 from whisperx.utils import LANGUAGES, TO_LANGUAGE_CODE, get_writer
-from whisperx.log_utils import get_logger
+from whisperx.log_utils import (
+    get_logger,
+    log_stage_started,
+    log_stage_completed,
+    log_model_loading,
+    log_model_loaded,
+    log_error,
+    STAGE_TRANSCRIPTION,
+    STAGE_ALIGNMENT,
+    STAGE_DIARIZATION,
+)
 
 logger = get_logger(__name__)
 
@@ -120,104 +130,121 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
 
     # Part 1: VAD & ASR Loop
     results = []
-    # model = load_model(model_name, device=device, download_root=model_dir)
-    model = load_model(
-        model_name,
-        device=device,
-        device_index=device_index,
-        download_root=model_dir,
-        compute_type=compute_type,
-        language=args["language"],
-        asr_options=asr_options,
-        vad_method=vad_method,
-        vad_options={
-            "chunk_size": chunk_size,
-            "vad_onset": vad_onset,
-            "vad_offset": vad_offset,
-        },
-        task=task,
-        local_files_only=model_cache_only,
-        threads=faster_whisper_threads,
-        use_auth_token=hf_token,
-    )
-
-    for audio_path in args.pop("audio"):
-        audio = load_audio(audio_path)
-        # >> VAD & ASR
-        logger.info("Performing transcription...")
-        result: TranscriptionResult = model.transcribe(
-            audio,
-            batch_size=batch_size,
-            chunk_size=chunk_size,
-            print_progress=print_progress,
-            verbose=verbose,
+    log_stage_started(STAGE_TRANSCRIPTION, logger=logger)
+    try:
+        log_model_loading(STAGE_TRANSCRIPTION, model=model_name, logger=logger)
+        model = load_model(
+            model_name,
+            device=device,
+            device_index=device_index,
+            download_root=model_dir,
+            compute_type=compute_type,
+            language=args["language"],
+            asr_options=asr_options,
+            vad_method=vad_method,
+            vad_options={
+                "chunk_size": chunk_size,
+                "vad_onset": vad_onset,
+                "vad_offset": vad_offset,
+            },
+            task=task,
+            local_files_only=model_cache_only,
+            threads=faster_whisper_threads,
+            use_auth_token=hf_token,
         )
-        results.append((result, audio_path))
+        log_model_loaded(STAGE_TRANSCRIPTION, logger=logger)
+
+        for audio_path in args.pop("audio"):
+            audio = load_audio(audio_path)
+            # >> VAD & ASR
+            result: TranscriptionResult = model.transcribe(
+                audio,
+                batch_size=batch_size,
+                chunk_size=chunk_size,
+                print_progress=print_progress,
+                verbose=verbose,
+            )
+            results.append((result, audio_path))
+    except Exception as e:
+        log_error(STAGE_TRANSCRIPTION, e, logger=logger)
+        raise
 
     # Unload Whisper and VAD
     del model
     gc.collect()
     torch.cuda.empty_cache()
+    log_stage_completed(STAGE_TRANSCRIPTION, logger=logger)
 
     # Part 2: Align Loop
     if not no_align:
+        log_stage_started(STAGE_ALIGNMENT, logger=logger)
         tmp_results = results
         results = []
         align_model, align_metadata = None, None
-        if align_model_name is not None:
-            align_model, align_metadata = load_align_model(
-                '', device, model_name=align_model_name, model_dir=model_dir, model_cache_only=model_cache_only
-            )
-        for result, audio_path in tmp_results:
-            # >> Align
-            if len(tmp_results) > 1:
-                input_audio = audio_path
-            else:
-                # lazily load audio from part 1
-                input_audio = audio
+        try:
+            if align_model_name is not None:
+                log_model_loading(STAGE_ALIGNMENT, model=align_model_name, logger=logger)
+                align_model, align_metadata = load_align_model(
+                    '', device, model_name=align_model_name, model_dir=model_dir, model_cache_only=model_cache_only
+                )
+                log_model_loaded(STAGE_ALIGNMENT, logger=logger)
 
-            result_language = result.get("language", "en") # preserve the (possibly auto-detected) language of this result
-            align_language = '' if align_metadata is None else align_metadata["language"]
-            language_has_changed = align_language != '' and align_language != result_language
+            for result, audio_path in tmp_results:
+                # >> Align
+                if len(tmp_results) > 1:
+                    input_audio = audio_path
+                else:
+                    # lazily load audio from part 1
+                    input_audio = audio
 
-            # load/reload model if necessary - will not happen if a fixed align_model has been specified via args
-            if align_model is None or language_has_changed:
-                if language_has_changed:
-                    logger.info(
-                        f"New language found ({result_language})! Previous was ({align_language}), loading new alignment model for new language..."
+                result_language = result.get("language", "en") # preserve the (possibly auto-detected) language of this result
+                align_language = '' if align_metadata is None else align_metadata["language"]
+                language_has_changed = align_language != '' and align_language != result_language
+
+                # load/reload model if necessary - will not happen if a fixed align_model has been specified via args
+                if align_model is None or language_has_changed:
+                    if language_has_changed:
+                        logger.info(
+                            f"New language found ({result_language})! Previous was ({align_language}), loading new alignment model for new language..."
+                        )
+
+                    # Unload previous align model
+                    if align_model is not None:
+                        del align_model
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                    log_model_loading(STAGE_ALIGNMENT, model=result_language, logger=logger)
+                    align_model, align_metadata = load_align_model(
+                        result_language, device, model_dir=model_dir, model_cache_only=model_cache_only
+                    )
+                    log_model_loaded(STAGE_ALIGNMENT, logger=logger)
+
+                if align_model is not None and len(result["segments"]) > 0:
+                    logger.info("Performing alignment...")
+                    result: AlignedTranscriptionResult = align(
+                        result["segments"],
+                        align_model,
+                        align_metadata,
+                        input_audio,
+                        device,
+                        interpolate_method=interpolate_method,
+                        return_char_alignments=return_char_alignments,
+                        print_progress=print_progress,
                     )
 
-                # Unload previous align model
-                if align_model is not None:
-                    del align_model
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                align_model, align_metadata = load_align_model(
-                    result_language, device, model_dir=model_dir, model_cache_only=model_cache_only
-                )
-
-            if align_model is not None and len(result["segments"]) > 0:
-                logger.info("Performing alignment...")
-                result: AlignedTranscriptionResult = align(
-                    result["segments"],
-                    align_model,
-                    align_metadata,
-                    input_audio,
-                    device,
-                    interpolate_method=interpolate_method,
-                    return_char_alignments=return_char_alignments,
-                    print_progress=print_progress,
-                )
-
-            # alignment drops the language key, restore the detected language
-            result["language"] = result_language
-            results.append((result, audio_path))
+                # alignment drops the language key, restore the detected language
+                result["language"] = result_language
+                results.append((result, audio_path))
+        except Exception as e:
+            log_error(STAGE_ALIGNMENT, e, logger=logger)
+            raise
 
         # Unload align model
         del align_model
         gc.collect()
         torch.cuda.empty_cache()
+        log_stage_completed(STAGE_ALIGNMENT, logger=logger)
 
     # >> Diarize
     if diarize:
@@ -226,30 +253,35 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 "No --hf_token provided, needs to be saved in environment variable, otherwise will throw error loading diarization model"
             )
         tmp_results = results
-        logger.info("Performing diarization...")
-        logger.info(f"Using model: {diarize_model_name}")
         results = []
-        diarize_model = DiarizationPipeline(model_name=diarize_model_name, token=hf_token, device=device, cache_dir=model_dir)
-        for result, input_audio_path in tmp_results:
-            diarize_result = diarize_model(
-                input_audio_path, 
-                min_speakers=min_speakers, 
-                max_speakers=max_speakers, 
-                return_embeddings=return_speaker_embeddings
-            )
+        log_stage_started(STAGE_DIARIZATION, logger=logger)
+        try:
+            diarize_model = DiarizationPipeline(model_name=diarize_model_name, token=hf_token, device=device, cache_dir=model_dir)
+            for result, input_audio_path in tmp_results:
+                diarize_result = diarize_model(
+                    input_audio_path,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                    return_embeddings=return_speaker_embeddings,
+                    print_progress=print_progress,
+                )
 
-            if return_speaker_embeddings:
-                diarize_segments, speaker_embeddings = diarize_result
-            else:
-                diarize_segments = diarize_result
-                speaker_embeddings = None
+                if return_speaker_embeddings:
+                    diarize_segments, speaker_embeddings = diarize_result
+                else:
+                    diarize_segments = diarize_result
+                    speaker_embeddings = None
 
-            result_language = result.get("language", "en")  # preserve the (possibly auto-detected) language of this result
+                result_language = result.get("language", "en")  # preserve the (possibly auto-detected) language of this result
 
-            result = assign_word_speakers(diarize_segments, result, speaker_embeddings)
-            # diarization drops the language key, restore the detected language
-            result["language"] = result_language
-            results.append((result, input_audio_path))
+                result = assign_word_speakers(diarize_segments, result, speaker_embeddings)
+                # diarization drops the language key, restore the detected language
+                result["language"] = result_language
+                results.append((result, input_audio_path))
+        except Exception as e:
+            log_error(STAGE_DIARIZATION, e, logger=logger)
+            raise
+        log_stage_completed(STAGE_DIARIZATION, logger=logger)
     # >> Write
     for result, audio_path in results:
         writer(result, audio_path, writer_args)

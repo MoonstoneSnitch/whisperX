@@ -6,7 +6,13 @@ import torch
 
 from whisperx.audio import load_audio, SAMPLE_RATE
 from whisperx.schema import TranscriptionResult, AlignedTranscriptionResult, ProgressCallback
-from whisperx.log_utils import get_logger
+from whisperx.log_utils import (
+    get_logger,
+    log_progress,
+    log_model_loading,
+    log_model_loaded,
+    STAGE_DIARIZATION,
+)
 
 logger = get_logger(__name__)
 
@@ -99,8 +105,9 @@ class DiarizationPipeline:
         if isinstance(device, str):
             device = torch.device(device)
         model_config = model_name or "pyannote/speaker-diarization-community-1"
-        logger.info(f"Loading diarization model: {model_config}")
+        log_model_loading(STAGE_DIARIZATION, model=model_config, logger=logger)
         self.model = Pipeline.from_pretrained(model_config, token=token, cache_dir=cache_dir).to(device)
+        log_model_loaded(STAGE_DIARIZATION, logger=logger)
 
     def __call__(
         self,
@@ -110,6 +117,7 @@ class DiarizationPipeline:
         max_speakers: Optional[int] = None,
         return_embeddings: bool = False,
         progress_callback: ProgressCallback = None,
+        print_progress: bool = False,
     ) -> Union[tuple[pd.DataFrame, Optional[dict[str, list[float]]]], pd.DataFrame]:
         """
         Perform speaker diarization on audio.
@@ -121,6 +129,7 @@ class DiarizationPipeline:
             max_speakers: Maximum number of speakers to detect
             return_embeddings: Whether to return speaker embeddings
             progress_callback: Optional callable receiving a float (0-100) with progress percentage
+            print_progress: If True, print progress updates using the centralized logger
 
         Returns:
             If return_embeddings is True:
@@ -136,7 +145,8 @@ class DiarizationPipeline:
         }
 
         hook = None
-        if progress_callback is not None:
+        report_progress = print_progress or progress_callback is not None
+        if report_progress:
             # pyannote's diarization has two progress-trackable steps, each with
             # its own completed/total counter that resets between steps. Map each
             # step into a sub-range so progress is monotonic and meaningful.
@@ -151,7 +161,10 @@ class DiarizationPipeline:
                     pct = offset + min(completed / total, 1.0) * (end - offset)
                     if pct > last_pct[0]:
                         last_pct[0] = pct
-                        progress_callback(pct)
+                        if print_progress:
+                            log_progress(STAGE_DIARIZATION, pct, logger=logger)
+                        if progress_callback is not None:
+                            progress_callback(pct)
 
         output = self.model(
             audio_data,
@@ -161,8 +174,11 @@ class DiarizationPipeline:
             **({"hook": hook} if hook is not None else {}),
         )
 
-        if progress_callback is not None:
-            progress_callback(100.0)
+        if report_progress:
+            if print_progress:
+                log_progress(STAGE_DIARIZATION, 100.0, logger=logger)
+            if progress_callback is not None:
+                progress_callback(100.0)
 
         diarization = output.speaker_diarization
         embeddings = output.speaker_embeddings if return_embeddings else None
