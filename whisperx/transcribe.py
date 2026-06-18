@@ -40,7 +40,7 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     # model_flush: bool = args.pop("model_flush")
     os.makedirs(output_dir, exist_ok=True)
 
-    align_model: str = args.pop("align_model")
+    align_model_name: str = args.pop("align_model")
     interpolate_method: str = args.pop("interpolate_method")
     no_align: bool = args.pop("no_align")
     task: str = args.pop("task")
@@ -81,9 +81,6 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 f"{model_name} is an English-only model but received '{args['language']}'; using English instead."
             )
         args["language"] = "en"
-    align_language = (
-        args["language"] if args["language"] is not None else "en"
-    )  # default to loading english if not specified
 
     temperature = args.pop("temperature")
     if (increment := args.pop("temperature_increment_on_fallback")) is not None:
@@ -166,9 +163,11 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
     if not no_align:
         tmp_results = results
         results = []
-        align_model, align_metadata = load_align_model(
-            align_language, device, model_name=align_model, model_dir=model_dir, model_cache_only=model_cache_only
-        )
+        align_model, align_metadata = None, None
+        if align_model_name is not None:
+            align_model, align_metadata = load_align_model(
+                '', device, model_name=align_model_name, model_dir=model_dir, model_cache_only=model_cache_only
+            )
         for result, audio_path in tmp_results:
             # >> Align
             if len(tmp_results) > 1:
@@ -177,15 +176,28 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 # lazily load audio from part 1
                 input_audio = audio
 
-            if align_model is not None and len(result["segments"]) > 0:
-                if result.get("language", "en") != align_metadata["language"]:
-                    # load new language
+            result_language = result.get("language", "en") # preserve the (possibly auto-detected) language of this result
+            align_language = '' if align_metadata is None else align_metadata["language"]
+            language_has_changed = align_language != '' and align_language != result_language
+
+            # load/reload model if necessary - will not happen if a fixed align_model has been specified via args
+            if align_model is None or language_has_changed:
+                if language_has_changed:
                     logger.info(
-                        f"New language found ({result['language']})! Previous was ({align_metadata['language']}), loading new alignment model for new language..."
+                        f"New language found ({result_language})! Previous was ({align_language}), loading new alignment model for new language..."
                     )
-                    align_model, align_metadata = load_align_model(
-                        result["language"], device, model_dir=model_dir, model_cache_only=model_cache_only
-                    )
+
+                # Unload previous align model
+                if align_model is not None:
+                    del align_model
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                align_model, align_metadata = load_align_model(
+                    result_language, device, model_dir=model_dir, model_cache_only=model_cache_only
+                )
+
+            if align_model is not None and len(result["segments"]) > 0:
                 logger.info("Performing alignment...")
                 result: AlignedTranscriptionResult = align(
                     result["segments"],
@@ -198,6 +210,8 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                     print_progress=print_progress,
                 )
 
+            # alignment drops the language key, restore the detected language
+            result["language"] = result_language
             results.append((result, audio_path))
 
         # Unload align model
@@ -230,9 +244,12 @@ def transcribe_task(args: dict, parser: argparse.ArgumentParser):
                 diarize_segments = diarize_result
                 speaker_embeddings = None
 
+            result_language = result.get("language", "en")  # preserve the (possibly auto-detected) language of this result
+
             result = assign_word_speakers(diarize_segments, result, speaker_embeddings)
+            # diarization drops the language key, restore the detected language
+            result["language"] = result_language
             results.append((result, input_audio_path))
     # >> Write
     for result, audio_path in results:
-        result["language"] = align_language
         writer(result, audio_path, writer_args)
